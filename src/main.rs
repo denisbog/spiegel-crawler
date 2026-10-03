@@ -1,28 +1,23 @@
 //! spiegel-crawler – download SPIEGEL articles (text + images + audio).
 //!
-//! Pure Rust: no Python, no Playwright, no WebDriver. For the parts that need a
-//! real browser (the interactive login and the client-rendered Merkliste) it
-//! drives the Chromium that is already installed, over the DevTools protocol.
+//! Two entry points:
+//!
+//! * `--login-http`  log in with plain HTTP requests (no browser) and save the
+//!                   session to `cookies.json`
+//! * `--list-url`    crawl every article of a page: feeds and section pages via
+//!                   their HTML, your own lists ("Ihre Artikel") via the JSON API
 //!
 //! ```text
-//! # 1. log in once with your account (writes cookies.json + urls.txt)
-//! cargo run --release -- --login --dry-run        # browser-driven, prompts for e-mail + password
-//! cargo run --release -- --login-http             # same, but plain HTTP requests only
-//!
-//! # 2. crawl everything
-//! cargo run --release -- --urls-file urls.txt --out articles
+//! spiegel-crawler --login-http                       # prompts for e-mail + password
+//! spiegel-crawler --list-url https://www.spiegel.de/fuermich/merkliste -o articles
+//! spiegel-crawler --list-url https://www.spiegel.de/politik/index.rss -o articles
 //! ```
-//!
-//! Without a login it still crawls every article link found in `--list-url`
-//! (RSS feeds, section pages) and all `--url`/`--urls-file` entries.
 
 mod api;
 mod article;
 mod auth;
-mod browser;
 mod fetch;
 mod form;
-mod firefox;
 mod login;
 mod store;
 mod util;
@@ -33,12 +28,10 @@ use clap::Parser;
 use fetch::Fetcher;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::io::IsTerminal;
-use std::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use store::Store;
-
-const MERKLISTE: &str = "https://www.spiegel.de/fuermich/merkliste";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,25 +48,13 @@ struct Cli {
     #[arg(short = 'f', long = "urls-file", value_name = "PATH")]
     urls_file: Option<PathBuf>,
 
-    /// Fetch this page (RSS feed, section page, Merkliste) and crawl every article link found
+    /// Crawl every article link of this page: RSS feed, section page, Merkliste
     #[arg(short = 'l', long = "list-url", value_name = "URL")]
     list_urls: Vec<String>,
 
-    /// Log in with Chromium first, then dump the Merkliste to urls.txt + cookies.json
-    #[arg(long)]
-    login: bool,
-
-    /// Log in with plain HTTP requests only (no browser at all)
+    /// Log in with plain HTTP requests (no browser) and save the session
     #[arg(long = "login-http")]
     login_http: bool,
-
-    /// Debug: GET this URL and print the login form found in it (no credentials sent)
-    #[arg(long = "parse-form", value_name = "URL")]
-    parse_form: Option<String>,
-
-    /// Merkliste URL to dump after --login
-    #[arg(long = "merkliste-url", default_value = MERKLISTE, value_name = "URL")]
-    merkliste_url: String,
 
     /// SPIEGEL e-mail (default: $SPIEGEL_USER)
     #[arg(long, value_name = "MAIL", env = "SPIEGEL_USER")]
@@ -83,57 +64,21 @@ struct Cli {
     #[arg(long, value_name = "PASS", env = "SPIEGEL_PASS", hide_env_values = true)]
     password: Option<String>,
 
-    /// Show the browser window (useful while debugging the login)
-    #[arg(long)]
-    headed: bool,
-
-    /// Chromium/Chrome binary to drive (default: auto-detect)
-    #[arg(long, value_name = "PATH")]
-    chrome: Option<PathBuf>,
-
-    /// Session cookies as JSON (Playwright storage_state.json also works)
+    /// Session cookies as JSON (written by --login-http)
     #[arg(long, default_value = "cookies.json", value_name = "PATH")]
     cookies: PathBuf,
 
-    /// Extra cookie as name=value (repeatable) – a login-free escape hatch
+    /// Extra cookie as name=value (repeatable) – a manual escape hatch
     #[arg(long = "cookie", value_name = "NAME=VALUE")]
     cookie_pairs: Vec<String>,
 
-    /// Proxy for HTTP and the browser, e.g. http://host:3128
-    #[arg(long, value_name = "URL", env = "SPIEGEL_PROXY")]
-    proxy: Option<String>,
-
-    /// Force the browser for listing pages even if plain HTTP finds links
-    #[arg(long)]
-    render: bool,
-
-    /// Import the spiegel.de cookies from your Firefox profile (no login automation)
-    #[arg(long = "from-firefox")]
-    from_firefox: bool,
-
-    /// Check whether the current cookies are a live login (reads the Merkliste) and exit
+    /// Check whether the current cookies still hold a session, then exit
     #[arg(long = "check-session")]
     check_session: bool,
 
-    /// Debug: render this URL in the browser, print the value of --eval, then exit (repeatable)
-    #[arg(long = "dump-url", value_name = "URL")]
-    dump_urls: Vec<String>,
-
-    /// Debug: with --dump-url, print the requests the page made (find the API behind the UI)
-    #[arg(long = "dump-network")]
-    dump_network: bool,
-
-    /// Debug: JS expression evaluated by --dump-url (may be async)
-    #[arg(long, value_name = "JS", default_value = "document.title")]
-    eval: String,
-
-    /// Debug: click elements with this exact text before --eval (repeatable)
-    #[arg(long = "click-text", value_name = "TEXT")]
-    click_text: Vec<String>,
-
-    /// Debug: run this JS step before --eval, in order (repeatable)
-    #[arg(long = "js", value_name = "JS")]
-    js_steps: Vec<String>,
+    /// Proxy for HTTP requests, e.g. http://host:3128
+    #[arg(long, value_name = "URL", env = "SPIEGEL_PROXY")]
+    proxy: Option<String>,
 
     /// Output directory
     #[arg(short = 'o', long = "out", default_value = "articles", value_name = "DIR")]
@@ -173,42 +118,8 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut discovered: Vec<String> = Vec::new();
 
-    // ── 0. session source: cookies from the local Firefox profile ────────────
-    if cli.from_firefox {
-        let fresh = firefox::import_firefox()?;
-        let mut state = if cli.cookies.exists() {
-            auth::StorageState::load(&cli.cookies)?
-        } else {
-            auth::StorageState::from_cookies(Vec::new())
-        };
-        for c in fresh {
-            if let Some(slot) = state.cookies.iter_mut().find(|e| e.name == c.name && e.domain == c.domain) {
-                *slot = c;
-            } else {
-                state.cookies.push(c);
-            }
-        }
-        state.save(&cli.cookies)?;
-        println!("session: {} cookies -> {}", state.cookies.len(), cli.cookies.display());
-    }
-
-    // ── 0b. debug: show the login form a page serves (GET only) ──────────────
-    if let Some(url) = &cli.parse_form {
-        let probe = Fetcher::new(None, cli.delay_ms, cli.verbose, cli.proxy.as_deref())?;
-        let f = login::fetch_form(&probe, url)?;
-        println!("action:           {}", f.action);
-        println!("method:           {}", f.method);
-        println!("e-mail field:     {:?}", f.email);
-        println!("password field:   {:?} (visible now: {})", f.password, f.password_visible);
-        println!("submit control:   {:?}", f.submit);
-        println!("hidden fields:    {:?}", f.fields.iter().filter(|x| x.kind == "hidden").map(|x| x.name.clone()).collect::<Vec<_>>());
-        println!("error on page:    {:?}", f.error);
-        return Ok(());
-    }
-
-    // ── 1. optional login: plain HTTP or browser ─────────────────────────────
+    // ── 1. log in (plain HTTP) ───────────────────────────────────────────────
     if cli.login_http {
         let user = match cli.user.clone() {
             Some(u) => u,
@@ -221,18 +132,14 @@ fn main() -> Result<()> {
         if pass.is_empty() {
             bail!("empty password");
         }
-        // a real jar: the two JSF steps must carry each other's cookies
-        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+
+        // a jar, because the two JSF steps must carry each other's cookies
+        let jar = Arc::new(reqwest::cookie::Jar::default());
         let probe = Fetcher::new(Some(jar), cli.delay_ms, cli.verbose, cli.proxy.as_deref())?;
         let res = login::login(&probe, &user, &pass, cli.verbose)?;
-        if cli.verbose {
-            let held = probe.cookie_names("https://www.spiegel.de/");
-            eprintln!("http login: cookies now held: {held:?}");
-        }
         if !res.logged_in {
             bail!("login finished without a session cookie");
         }
-        // merge into whatever cookies.json already had (consent etc.)
         let mut state = if cli.cookies.exists() {
             auth::StorageState::load(&cli.cookies)?
         } else {
@@ -251,160 +158,60 @@ fn main() -> Result<()> {
             state.cookies.len(),
             cli.cookies.display()
         );
-        println!("note: --from-firefox is now unnecessary; --check-session verifies the session");
+        println!("next: --list-url https://www.spiegel.de/fuermich/merkliste -o articles");
         return Ok(());
     }
 
-    if cli.login {
-        // Credentials: --user/--password, else $SPIEGEL_USER/$SPIEGEL_PASS,
-        // else ask on the terminal (the password without echo).
-        let user = match cli.user.clone() {
-            Some(u) => u,
-            None => prompt_line("SPIEGEL e-mail: ")?.context("no e-mail given")?,
-        };
-        let pass = match cli.password.clone() {
-            Some(p) => p,
-            None => prompt_password("SPIEGEL password: ")?,
-        };
-        if pass.is_empty() {
-            bail!("empty password");
-        }
-        let chrome = match &cli.chrome {
-            Some(p) => p.clone(),
-            None => browser::locate_chrome().context(
-                "no Chromium/Chrome found – set --chrome, or skip --login and use \
-                 --cookies/--cookie with an existing session",
-            )?,
-        };
-        println!("chrome: {}", chrome.display());
-        let res = browser::login_and_dump(
-            &chrome,
-            &user,
-            &pass,
-            &cli.merkliste_url,
-            cli.headed,
-            cli.proxy.as_deref(),
-            cli.verbose,
-        )?;
-        println!("merkliste: {} article link(s)", res.urls.len());
-        if !res.logged_in {
-            eprintln!("! login was not confirmed – rerun with --headed to see what the browser is doing");
-        }
-        let state = auth::StorageState::from_cookies(res.cookies);
-        state.save(&cli.cookies)?;
-        println!("wrote {} ({} cookies)", cli.cookies.display(), state.cookies.len());
-        if res.logged_in {
-            write_url_list("urls.txt", &res.urls)?;
-            println!("wrote urls.txt ({} URLs)", res.urls.len());
-        } else {
-            eprintln!("! not writing urls.txt: the links on an unauthenticated Merkliste are not yours");
-        }
-        discovered = res.urls;
-    }
-
-    // ── 2. HTTP client with whatever session we have ─────────────────────────
-    let mut jars = Vec::new();
-    let mut session: Vec<auth::StorageCookie> = Vec::new();
-    #[allow(unused_assignments)]
+    // ── 2. HTTP client with the session we have ──────────────────────────────
+    let jar = Arc::new(reqwest::cookie::Jar::default());
     if cli.cookies.exists() {
         let state = auth::StorageState::load(&cli.cookies)?;
         eprintln!("auth: {} cookies from {}", state.cookies.len(), cli.cookies.display());
-        session = state.cookies.clone();
-        jars.push(state.into_jar()?);
-    } else if !cli.cookie_pairs.is_empty() {
-        jars.push(auth::jar_from_pairs(&cli.cookie_pairs)?);
-    } else {
+        for c in &state.cookies {
+            auth::add_cookie(&jar, c);
+        }
+    } else if cli.cookie_pairs.is_empty() {
         eprintln!(
-            "warning: no session ({} not found) – crawling anonymously; \
-             paywalled articles will be truncated. Use --login or --cookie.",
+            "warning: no session ({} not found) – crawling anonymously; paywalled articles \
+             will be truncated. Run --login-http first.",
             cli.cookies.display()
         );
     }
-    let fetcher = Fetcher::new(jars.pop(), cli.delay_ms, cli.verbose, cli.proxy.as_deref())?;
-
-    // ── 1b. debug: render + eval ─────────────────────────────────────────────
-    if !cli.dump_urls.is_empty() {
-        let chrome = cli
-            .chrome
-            .clone()
-            .or_else(browser::locate_chrome)
-            .context("no Chromium/Chrome found")?;
-        for url in &cli.dump_urls {
-            let mut b = browser::Browser::launch(&chrome, cli.headed, cli.proxy.as_deref(), cli.verbose)?;
-            if !session.is_empty() {
-                let n = b.set_cookies(&session)?;
-                if cli.verbose {
-                    eprintln!("debug: {n} session cookies installed");
-                }
-            }
-            b.goto(url, std::time::Duration::from_millis(2500))?;
-            for t in &cli.click_text {
-                println!("click {t:?}: {}", b.click_text(t)?);
-                // the click may navigate: wait for the new document to settle
-                let _ = b.wait_for("document.readyState === 'complete'", std::time::Duration::from_secs(20));
-                std::thread::sleep(std::time::Duration::from_millis(3000));
-            }
-            for (i, step) in cli.js_steps.iter().enumerate() {
-                let r = b.eval(step)?;
-                println!("js[{i}]: {}", serde_json::to_string(&r)?);
-                let _ = b.wait_for("document.readyState === 'complete'", std::time::Duration::from_secs(20));
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-            }
-            let v = b.eval(&cli.eval)?;
-            if cli.dump_network {
-                // give the page's own fetches time to happen, then scroll (lazy lists)
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                let _ = b.eval("window.scrollTo(0, document.body.scrollHeight)");
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                println!("--- requests ---");
-                for line in b.network_log() {
-                    println!("{line}");
-                }
-                println!("--- result ---");
-            }
-            println!("{}", serde_json::to_string_pretty(&v)?);
-        }
-        return Ok(());
+    for p in &cli.cookie_pairs {
+        let Some((name, value)) = p.split_once('=') else {
+            bail!("--cookie wants name=value, got {p:?}");
+        };
+        auth::add_raw_cookie(&jar, name.trim(), value);
     }
+    let fetcher = Fetcher::new(Some(jar), cli.delay_ms, cli.verbose, cli.proxy.as_deref())?;
 
-    // ── 1a. session check ────────────────────────────────────────────────────
+    // ── 3. session check, if asked ───────────────────────────────────────────
     if cli.check_session {
-        let hints: Vec<&str> = session
-            .iter()
-            .map(|c| c.name.as_str())
-            .filter(|n| auth::SESSION_COOKIE_HINTS.contains(n))
-            .collect();
-        let (_, html) = fetcher.text(&cli.merkliste_url)?;
-        let links = article::links_in_html(&html);
-        println!("page:                 {}", cli.merkliste_url);
-        println!(
-            "cookies:              {} loaded; session cookies: {}",
-            session.len(),
-            if hints.is_empty() { "none".to_string() } else { hints.join(", ") }
-        );
-        println!("article links in HTML: {}", links.len());
-        if links.is_empty() {
-            println!(
-                "\nthe list is not in the HTML – the page fetches it with JavaScript, so render it:\n  \
-                 spiegel-crawler --list-url {} --render -o articles",
-                cli.merkliste_url
-            );
+        let hints = fetcher.session_cookie_names();
+        let marks = api::bookmarks(&fetcher);
+        println!("session cookies: {}", if hints.is_empty() { "none".to_string() } else { hints.join(", ") });
+        match marks {
+            Ok(m) => println!("merkliste: {} bookmark(s)", m.len()),
+            Err(e) => {
+                println!("merkliste: not available ({e})");
+                println!("\nRun --login-http to get a session.");
+                std::process::exit(2);
+            }
+        }
+        if hints.is_empty() {
             std::process::exit(2);
         }
-        for u in links.iter().take(10) {
-            println!("  {u}");
-        }
         return Ok(());
     }
 
-    // ── 3. work list ─────────────────────────────────────────────────────────
-    let mut urls = collect_urls(&cli, &fetcher, discovered, &session)?;
+    // ── 4. work list ─────────────────────────────────────────────────────────
+    let mut urls = collect_urls(&cli, &fetcher)?;
     if cli.limit > 0 && urls.len() > cli.limit {
         println!("limiting to the first {} of {} articles", cli.limit, urls.len());
         urls.truncate(cli.limit);
     }
     if urls.is_empty() {
-        bail!("no article URLs (use --login, --url, --urls-file or --list-url)");
+        bail!("no article URLs (use --login-http and/or --list-url, --url, --urls-file)");
     }
     println!("{} article(s) to crawl", urls.len());
     if cli.dry_run {
@@ -414,7 +221,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── 4. crawl ─────────────────────────────────────────────────────────────
+    // ── 5. crawl ─────────────────────────────────────────────────────────────
     let store = Store::new(&cli.out, !cli.no_images, !cli.no_audio, cli.force);
     std::fs::create_dir_all(&cli.out).with_context(|| format!("creating {}", cli.out.display()))?;
 
@@ -474,15 +281,10 @@ fn crawl_one(fetcher: &Fetcher, store: &Store, url: &str) -> Result<(PathBuf, Ar
 }
 
 /// Explicit URLs + URL file + links discovered on listing pages.
-fn collect_urls(
-    cli: &Cli,
-    fetcher: &Fetcher,
-    discovered: Vec<String>,
-    session: &[auth::StorageCookie],
-) -> Result<Vec<String>> {
+fn collect_urls(cli: &Cli, fetcher: &Fetcher) -> Result<Vec<String>> {
     let mut set: BTreeSet<String> = BTreeSet::new();
 
-    for u in cli.urls.iter().chain(discovered.iter()) {
+    for u in &cli.urls {
         match article::normalize_url(u) {
             Some(u) => {
                 set.insert(u);
@@ -508,65 +310,38 @@ fn collect_urls(
     }
 
     for list in &cli.list_urls {
-        let mut found = Vec::new();
-
-        // Personal lists have a JSON API – no browser needed.
-        if is_personal(list) && !cli.render {
+        // Personal lists are backed by a JSON API – one request, no scraping.
+        if is_personal(list) {
             match api::bookmarks(fetcher) {
                 Ok(marks) if !marks.is_empty() => {
-                    println!("listing {list}: {} bookmark(s) via {}", marks.len(), api::BOOKMARKS_API);
+                    println!("listing {list}: {} bookmark(s)", marks.len());
                     for m in &marks {
-                        println!("  {} [{}]", m.title, if m.access_level.is_empty() { "?" } else { &m.access_level });
+                        println!(
+                            "  {} [{}]",
+                            m.title,
+                            if m.access_level.is_empty() { "?" } else { &m.access_level }
+                        );
                     }
-                    found = marks.into_iter().map(|m| m.url).collect();
-                }
-                Ok(_) => eprintln!("  ! the bookmarks API reports an empty list"),
-                Err(e) => eprintln!("  ! bookmarks API failed ({e:#}); falling back to the page"),
-            }
-        }
-
-        if found.is_empty() {
-            found = http_links(fetcher, list)?;
-        }
-        if found.is_empty() || cli.render {
-            if let Some(chrome) = cli.chrome.clone().or_else(browser::locate_chrome) {
-                println!("listing {list}: rendering in the browser…");
-                match browser::render_links(&chrome, list, &session, list.contains("/fuermich/"), cli.headed, cli.proxy.as_deref(), cli.verbose) {
-                    Ok(r) => {
-                        found = r.urls;
-                        // Logging in by hand in a --headed window still pays off:
-                        // the session is exported for the HTTP crawl.  Never let an
-                        // *anonymous* render overwrite a good session file.
-                        if !auth::looks_logged_in(&r.cookies) {
-                            eprintln!(
-                                "  ! the browser holds no session cookie – leaving {} untouched",
-                                cli.cookies.display()
-                            );
-                        } else if !r.cookies.is_empty() {
-                            let mut state = if cli.cookies.exists() {
-                                auth::StorageState::load(&cli.cookies)?
-                            } else {
-                                auth::StorageState::from_cookies(Vec::new())
-                            };
-                            for c in r.cookies {
-                                if !state.cookies.iter().any(|e| e.name == c.name && e.domain == c.domain) {
-                                    state.cookies.push(c);
-                                }
-                            }
-                            state.save(&cli.cookies)?;
-                            println!("  session: {} cookies -> {}", state.cookies.len(), cli.cookies.display());
+                    for m in marks {
+                        if let Some(u) = article::normalize_url(&m.url) {
+                            set.insert(u);
                         }
                     }
-                    Err(e) => eprintln!("  ! browser render failed: {e:#}"),
+                    continue;
                 }
+                Ok(_) => eprintln!("  ! the bookmarks API reports an empty list"),
+                Err(e) => eprintln!(
+                    "  ! bookmarks API failed ({e:#}). Without a session there is nothing to list \
+                     – run --login-http."
+                ),
             }
+            continue;
         }
+
+        let found = http_links(fetcher, list)?;
         println!("listing {list}: {} article link(s)", found.len());
         if found.is_empty() {
-            eprintln!(
-                "  ! nothing found. A personal list needs a session: try --from-firefox \
-                 (imports your Firefox cookies), then --check-session. Fallback: --login."
-            );
+            eprintln!("  ! no article links found on that page");
         }
         for u in found {
             if let Some(u) = article::normalize_url(&u) {
@@ -588,15 +363,6 @@ fn http_links(fetcher: &Fetcher, url: &str) -> Result<Vec<String>> {
     Ok(article::links_in_html(&body))
 }
 
-fn write_url_list(path: &str, urls: &[String]) -> Result<()> {
-    let mut body = urls.join("\n");
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    std::fs::write(path, body).with_context(|| format!("writing {path}"))?;
-    Ok(())
-}
-
 /// Prompt on the terminal (visible input), e.g. for the e-mail address.
 fn prompt_line(what: &str) -> Result<Option<String>> {
     use std::io::Write;
@@ -604,7 +370,7 @@ fn prompt_line(what: &str) -> Result<Option<String>> {
     std::io::stdout().flush().ok();
     let mut s = String::new();
     if std::io::stdin().read_line(&mut s)? == 0 {
-        return Ok(None); // EOF (e.g. no terminal attached)
+        return Ok(None); // EOF (no terminal attached)
     }
     let s = s.trim().to_string();
     Ok(if s.is_empty() { None } else { Some(s) })
@@ -613,9 +379,8 @@ fn prompt_line(what: &str) -> Result<Option<String>> {
 /// Prompt for a secret without echoing it.
 fn prompt_password(what: &str) -> Result<String> {
     if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "no terminal to ask for the password on – pass --password, set $SPIEGEL_PASS, \
-             or import an existing session with --from-firefox"
+        bail!(
+            "no terminal to ask for the password on – pass --password or set $SPIEGEL_PASS"
         );
     }
     Ok(rpassword::prompt_password(what)?.trim().to_string())

@@ -162,6 +162,14 @@ impl Fetcher {
         names
     }
 
+    /// Names of the held cookies that indicate a session.
+    pub fn session_cookie_names(&self) -> Vec<String> {
+        self.cookie_names("https://www.spiegel.de/")
+            .into_iter()
+            .filter(|n| crate::auth::SESSION_COOKIE_HINTS.contains(&n.as_str()))
+            .collect()
+    }
+
     /// Download to `dest`, resuming a `dest.part` file if present.
     /// Returns the number of bytes on disk (0 for a skipped existing file).
     pub fn download(&self, url: &str, dest: &Path, force: bool) -> Result<u64> {

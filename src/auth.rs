@@ -15,7 +15,6 @@ use anyhow::{Context, Result};
 use reqwest::cookie::Jar;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Arc;
 use url::Url;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,38 +75,6 @@ impl StorageState {
         serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))
     }
 
-    /// Build a cookie jar.  Playwright stores cookies for many domains; we keep
-    /// the ones relevant for spiegel.de.
-    pub fn into_jar(self) -> Result<Arc<Jar>> {
-        let jar = Arc::new(Jar::default());
-        let mut kept = 0usize;
-        for c in &self.cookies {
-            let domain = c.domain.trim_start_matches('.').to_string();
-            let domain = if domain.is_empty() { "www.spiegel.de".to_string() } else { domain };
-            let url = Url::parse(&format!("https://{}{}", domain, c.path))
-                .unwrap_or_else(|_| Url::parse("https://www.spiegel.de/").unwrap());
-            let mut s = format!("{}={}; Path={}", c.name, c.value, c.path);
-            s.push_str(&format!("; Domain={}", c.domain.trim_start_matches('.')));
-            if c.secure {
-                s.push_str("; Secure");
-            }
-            if c.http_only {
-                s.push_str("; HttpOnly");
-            }
-            jar.add_cookie_str(&s, &url);
-            kept += 1;
-        }
-        let ls: usize = self.origins.iter().map(|o| o.local_storage.len()).sum();
-        if ls > 0 {
-            eprintln!(
-                "note: state.json also carries {ls} localStorage entries (origins: {}); \
-                 this crawler only replays cookies",
-                self.origins.iter().map(|o| o.origin.as_str()).collect::<Vec<_>>().join(", ")
-            );
-        }
-        eprintln!("auth: loaded {kept} cookies from storage state");
-        Ok(jar)
-    }
 }
 
 
@@ -119,6 +86,33 @@ pub const SESSION_COOKIE_HINTS: &[&str] =
 /// Does this cookie set look like a live login?
 pub fn looks_logged_in(cookies: &[StorageCookie]) -> bool {
     cookies.iter().any(|c| SESSION_COOKIE_HINTS.contains(&c.name.as_str()))
+}
+
+/// Put one stored cookie into a jar.
+pub fn add_cookie(jar: &Jar, c: &StorageCookie) {
+    let domain = c.domain.trim_start_matches('.').to_string();
+    let domain = if domain.is_empty() { "www.spiegel.de".to_string() } else { domain };
+    let path = if c.path.is_empty() { "/" } else { &c.path };
+    let url = Url::parse(&format!("https://{domain}{path}"))
+        .unwrap_or_else(|_| Url::parse("https://www.spiegel.de/").unwrap());
+    let mut s = format!("{}={}; Path={path}", c.name, c.value);
+    if !c.domain.is_empty() {
+        s.push_str(&format!("; Domain={}", c.domain.trim_start_matches('.')));
+    }
+    if c.secure {
+        s.push_str("; Secure");
+    }
+    if c.http_only {
+        s.push_str("; HttpOnly");
+    }
+    jar.add_cookie_str(&s, &url);
+}
+
+/// `--cookie name=value`, valid for .spiegel.de.
+pub fn add_raw_cookie(jar: &Jar, name: &str, value: &str) {
+    if let Ok(url) = Url::parse("https://www.spiegel.de/") {
+        jar.add_cookie_str(&format!("{name}={value}; Path=/; Domain=.spiegel.de"), &url);
+    }
 }
 
 /// Parse one `Set-Cookie` header into a storable cookie.
@@ -148,15 +142,3 @@ pub fn parse_set_cookie(raw: &str, host: &str) -> Option<StorageCookie> {
     Some(c)
 }
 
-/// Build a jar from `--cookie name=value` pairs (all for .spiegel.de).
-pub fn jar_from_pairs(pairs: &[String]) -> Result<Arc<Jar>> {
-    let jar = Arc::new(Jar::default());
-    let url = Url::parse("https://www.spiegel.de/")?;
-    for p in pairs {
-        let Some((name, value)) = p.split_once('=') else {
-            anyhow::bail!("--cookie wants name=value, got {p:?}");
-        };
-        jar.add_cookie_str(&format!("{}={}; Path=/; Domain=.spiegel.de", name.trim(), value), &url);
-    }
-    Ok(jar)
-}
