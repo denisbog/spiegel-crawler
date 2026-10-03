@@ -104,6 +104,10 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// Accept a Merkliste that comes back shorter than expected
+    #[arg(long = "allow-partial")]
+    allow_partial: bool,
+
     /// Only resolve and print the URL list
     #[arg(long = "dry-run")]
     dry_run: bool,
@@ -188,10 +192,10 @@ fn main() -> Result<()> {
     // ── 3. session check, if asked ───────────────────────────────────────────
     if cli.check_session {
         let hints = fetcher.session_cookie_names();
-        let marks = api::bookmarks(&fetcher);
+        let marks = api::bookmarks(&fetcher, cli.allow_partial);
         println!("session cookies: {}", if hints.is_empty() { "none".to_string() } else { hints.join(", ") });
         match marks {
-            Ok(m) => println!("merkliste: {} bookmark(s)", m.len()),
+            Ok(m) => println!("merkliste: {} of {} bookmark(s)", m.items.len(), m.requested),
             Err(e) => {
                 println!("merkliste: not available ({e})");
                 println!("\nRun --login-http to get a session.");
@@ -205,12 +209,18 @@ fn main() -> Result<()> {
     }
 
     // ── 4. work list ─────────────────────────────────────────────────────────
-    let mut urls = collect_urls(&cli, &fetcher)?;
+    let WorkList { mut urls, failed_listings } = collect_urls(&cli, &fetcher)?;
+    for l in &failed_listings {
+        eprintln!("! listing failed: {l}");
+    }
     if cli.limit > 0 && urls.len() > cli.limit {
         println!("limiting to the first {} of {} articles", cli.limit, urls.len());
         urls.truncate(cli.limit);
     }
     if urls.is_empty() {
+        if !failed_listings.is_empty() {
+            std::process::exit(2);
+        }
         bail!("no article URLs (use --login-http and/or --list-url, --url, --urls-file)");
     }
     println!("{} article(s) to crawl", urls.len());
@@ -267,6 +277,11 @@ fn main() -> Result<()> {
     if !failures.is_empty() {
         std::process::exit(1);
     }
+    if !failed_listings.is_empty() {
+        // crawled what we could, but the run was incomplete: let scripts notice
+        eprintln!("! {} listing(s) produced nothing – exiting non-zero", failed_listings.len());
+        std::process::exit(2);
+    }
     Ok(())
 }
 
@@ -280,9 +295,16 @@ fn crawl_one(fetcher: &Fetcher, store: &Store, url: &str) -> Result<(PathBuf, Ar
     Ok((dir, a))
 }
 
+/// The work list plus the listings that produced nothing.
+struct WorkList {
+    urls: Vec<String>,
+    failed_listings: Vec<String>,
+}
+
 /// Explicit URLs + URL file + links discovered on listing pages.
-fn collect_urls(cli: &Cli, fetcher: &Fetcher) -> Result<Vec<String>> {
+fn collect_urls(cli: &Cli, fetcher: &Fetcher) -> Result<WorkList> {
     let mut set: BTreeSet<String> = BTreeSet::new();
+    let mut failed_listings: Vec<String> = Vec::new();
 
     for u in &cli.urls {
         match article::normalize_url(u) {
@@ -312,28 +334,31 @@ fn collect_urls(cli: &Cli, fetcher: &Fetcher) -> Result<Vec<String>> {
     for list in &cli.list_urls {
         // Personal lists are backed by a JSON API – one request, no scraping.
         if is_personal(list) {
-            match api::bookmarks(fetcher) {
-                Ok(marks) if !marks.is_empty() => {
-                    println!("listing {list}: {} bookmark(s)", marks.len());
-                    for m in &marks {
+            match api::bookmarks(fetcher, cli.allow_partial) {
+                Ok(b) if !b.items.is_empty() => {
+                    println!("listing {list}: {} of {} bookmark(s)", b.items.len(), b.requested);
+                    for m in &b.items {
                         println!(
                             "  {} [{}]",
                             m.title,
                             if m.access_level.is_empty() { "?" } else { &m.access_level }
                         );
                     }
-                    for m in marks {
+                    for m in b.items {
                         if let Some(u) = article::normalize_url(&m.url) {
                             set.insert(u);
                         }
                     }
                     continue;
                 }
-                Ok(_) => eprintln!("  ! the bookmarks API reports an empty list"),
-                Err(e) => eprintln!(
-                    "  ! bookmarks API failed ({e:#}). Without a session there is nothing to list \
-                     – run --login-http."
-                ),
+                Ok(_) => {
+                    eprintln!("  ! the bookmarks API reports an empty list");
+                    failed_listings.push(format!("{list} (empty)"));
+                }
+                Err(e) => {
+                    eprintln!("  ! bookmarks API failed: {e:#}");
+                    failed_listings.push(format!("{list} ({e})"));
+                }
             }
             continue;
         }
@@ -342,6 +367,7 @@ fn collect_urls(cli: &Cli, fetcher: &Fetcher) -> Result<Vec<String>> {
         println!("listing {list}: {} article link(s)", found.len());
         if found.is_empty() {
             eprintln!("  ! no article links found on that page");
+            failed_listings.push(format!("{list} (no links)"));
         }
         for u in found {
             if let Some(u) = article::normalize_url(&u) {
@@ -350,7 +376,7 @@ fn collect_urls(cli: &Cli, fetcher: &Fetcher) -> Result<Vec<String>> {
         }
     }
 
-    Ok(set.into_iter().collect())
+    Ok(WorkList { urls: set.into_iter().collect(), failed_listings })
 }
 
 /// Pages under /fuermich/ are "mine": they are backed by the bookmarks API.

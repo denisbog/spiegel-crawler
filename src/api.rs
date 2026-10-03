@@ -14,7 +14,7 @@
 //! can be crawled without launching a browser at all.
 
 use crate::fetch::Fetcher;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 pub const BOOKMARKS_API: &str = "https://www.spiegel.de/services/depot/api/v1/bookmarks";
@@ -51,12 +51,21 @@ pub fn bookmark_ids(fetcher: &Fetcher) -> Result<Vec<String>> {
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    Ok(ids)
+    let mut unique: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !unique.contains(&id) {
+            unique.push(id);
+        }
+    }
+    Ok(unique)
 }
 
 /// Article data (url, title, access level) for a list of ids.
-pub fn articles_by_ids(fetcher: &Fetcher, ids: &[String]) -> Result<Vec<Bookmark>> {
+/// Also returns the ids that came back without a usable url.
+pub fn articles_by_ids(fetcher: &Fetcher, ids: &[String]) -> Result<(Vec<Bookmark>, Vec<String>)> {
     let mut out = Vec::new();
+    let mut unusable = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     for chunk in ids.chunks(40) {
         let url = format!("{SEARCH_API}?ids={}", chunk.join(","));
         let (_, body) = fetcher
@@ -71,6 +80,7 @@ pub fn articles_by_ids(fetcher: &Fetcher, ids: &[String]) -> Result<Vec<Bookmark
             .cloned()
             .unwrap_or_default();
         for r in results {
+            let id = r.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
             let link = r
                 .get("url")
                 .and_then(Value::as_str)
@@ -78,8 +88,10 @@ pub fn articles_by_ids(fetcher: &Fetcher, ids: &[String]) -> Result<Vec<Bookmark
                 .or_else(|| r.get("url_absolute").and_then(Value::as_str).map(String::from))
                 .unwrap_or_default();
             if link.is_empty() {
+                unusable.push(if id.is_empty() { "<no id>".to_string() } else { id });
                 continue;
             }
+            seen.push(id);
             out.push(Bookmark {
                 url: link,
                 title: r
@@ -96,18 +108,93 @@ pub fn articles_by_ids(fetcher: &Fetcher, ids: &[String]) -> Result<Vec<Bookmark
             });
         }
     }
-    Ok(out)
+    let mut unique_items: Vec<Bookmark> = Vec::with_capacity(out.len());
+    for b in out {
+        if !unique_items.iter().any(|x| x.url == b.url) {
+            unique_items.push(b);
+        }
+    }
+    let out = unique_items;
+
+    // ids the search endpoint never answered for
+    for id in ids {
+        if !seen.contains(id) && !unusable.contains(id) {
+            unusable.push(id.clone());
+        }
+    }
+    Ok((out, unusable))
+}
+
+pub struct Bookmarks {
+    pub items: Vec<Bookmark>,
+    pub requested: usize,
 }
 
 /// The whole "Ihre Artikel" list, browser-free.
-pub fn bookmarks(fetcher: &Fetcher) -> Result<Vec<Bookmark>> {
+///
+/// Strict by default: a list that comes back shorter than the ids we asked for
+/// means part of your Merkliste would be silently missing, so it is an error
+/// unless `allow_partial` is set.
+pub fn bookmarks(fetcher: &Fetcher, allow_partial: bool) -> Result<Bookmarks> {
     let ids = bookmark_ids(fetcher)?;
     if ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Bookmarks { items: Vec::new(), requested: 0 });
     }
-    articles_by_ids(fetcher, &ids)
+    let requested = ids.len();
+    let (items, unusable) = articles_by_ids(fetcher, &ids)?;
+    check_complete(requested, items.len(), &unusable, allow_partial)?;
+    Ok(Bookmarks { items, requested })
+}
+
+/// Shared by `bookmarks` and the unit tests: is this list complete?
+fn check_complete(requested: usize, got: usize, unusable: &[String], allow_partial: bool) -> Result<()> {
+    if got == requested && unusable.is_empty() {
+        return Ok(());
+    }
+    let detail = if unusable.is_empty() {
+        String::new()
+    } else {
+        let mut shown = unusable.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        if unusable.len() > 5 {
+            shown.push_str(&format!(", … (+{} more)", unusable.len() - 5));
+        }
+        format!("; no usable entry for: {shown}")
+    };
+    let msg = format!(
+        "bookmarks API returned {got} usable entries for {requested} bookmarked ids{detail}"
+    );
+    if allow_partial {
+        eprintln!("  ! {msg} – crawling the partial list (--allow-partial)");
+        Ok(())
+    } else {
+        bail!("{msg}. Nothing was crawled; rerun with --allow-partial to accept the short list.")
+    }
 }
 
 fn snippet(body: &str) -> String {
     body.chars().take(120).collect::<String>().replace('\n', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_list_passes() {
+        assert!(check_complete(5, 5, &[], false).is_ok());
+    }
+
+    #[test]
+    fn short_list_fails_unless_allowed() {
+        let err = check_complete(5, 3, &[], false).unwrap_err().to_string();
+        assert!(err.contains("3 usable entries for 5"), "{err}");
+        assert!(err.contains("allow-partial"), "{err}");
+        assert!(check_complete(5, 3, &[], true).is_ok());
+    }
+
+    #[test]
+    fn entries_without_a_url_count_as_missing() {
+        let err = check_complete(3, 3, &["abc".to_string()], false).unwrap_err().to_string();
+        assert!(err.contains("no usable entry for: abc"), "{err}");
+    }
 }

@@ -61,6 +61,24 @@ else the prompt (password without echo). The session is written to
 | `/fuermich/…` (your own lists) | two JSON requests: `GET /services/depot/api/v1/bookmarks` → ids, then `GET /services/sitesearch/fetch?ids=…` → `{url, title, access_level}` (`src/api.rs`). The page itself has no article links in its HTML — it renders them with JavaScript, which is why scraping it does not work; without a session the API answers `400 http: named cookie not present`. |
 | RSS feeds, section pages | the article links are in the HTML, scoped to `<main>` so header/footer links are not mistaken for content (`src/article.rs`) |
 
+### What happens when a listing breaks
+
+A listing never falls back to "whatever links are on the page" — that would fill
+`articles/` with navigation links (Spiele, Rechner, Sudoku) that look like a
+valid list. Instead:
+
+* a short list is an error: the ids from `/bookmarks` are compared with the
+  entries that actually came back, and a mismatch aborts the run
+  (`bookmarks API returned 3 usable entries for 5 bookmarked ids …`) unless
+  `--allow-partial` is given
+* a listing that produces nothing is reported and makes the process **exit 2**,
+  even when other sources (`--url`, feeds) were crawled successfully, so a
+  `cron` job or script can tell the run was incomplete
+* nothing resolved at all → exit non-zero without writing anything
+
+The count is always printed (`listing …: 1 of 1 bookmark(s)`), so a silently
+shrinking Merkliste is visible rather than merely absent.
+
 ## Article extraction
 
 | Data | Source |
@@ -95,6 +113,7 @@ are filtered out (`SKIP_AREAS`/`SKIP_CLASSES`/`SKIP_COMPONENTS` in `src/article.
 | `-n, --limit <N>` | stop after N articles |
 | `--no-images`, `--no-audio`, `--force` | skip / re-download media |
 | `--dry-run` | resolve and print the work list only |
+| `--allow-partial` | accept a Merkliste that comes back shorter than expected |
 | `-v, --verbose` | per-file logging, login steps by field name |
 
 ## Status
@@ -105,6 +124,9 @@ bookmark(s)`), the bookmark API returns the list, and crawling fetches complete
 articles with text, images and audio (the five Merkliste bookmarks: up to 2314
 words each, 21 images, 5 audio files, 45 MB, 0 failures). The form parser has
 unit tests (`cargo test`), and RSS/section listing needs no session at all.
+
+Exit codes: `0` complete, `1` at least one article failed, `2` a listing produced
+nothing or the session is missing.
 
 Not covered: 2FA or a captcha, should SPIEGEL ever add one to the SSO form — the
 login would then report the page state instead of guessing. The internal
