@@ -7,15 +7,19 @@ Playwright, no WebDriver.
 ```bash
 cargo build --release
 
-# feeds / section pages need no session at all
-./target/release/spiegel-crawler --list-url https://www.spiegel.de/schlagzeilen/index.rss -n 5 -o articles
-
-# your own list ("Ihre Artikel" = /fuermich/merkliste): take the session you
-# already have in Firefox, then crawl it
-./target/release/spiegel-crawler --from-firefox          # spiegel.de cookies -> cookies.json
-./target/release/spiegel-crawler --check-session          # tells you what is missing, if anything
+# a) log in with your account – no browser import, it prompts for e-mail + password
+./target/release/spiegel-crawler --login --dry-run
+#    -> cookies.json (session) + urls.txt ("Ihre Artikel"), then crawl it:
+./target/release/spiegel-crawler --urls-file urls.txt -o articles-ihre-artikel
+#    (or crawl the list straight from the page, which needs the browser:)
 ./target/release/spiegel-crawler --list-url https://www.spiegel.de/fuermich/merkliste \
-    --render -o articles-ihre-artikel -j 2
+    --render -o articles-ihre-artikel
+
+# b) alternative without any credentials: reuse the session of your own browser
+./target/release/spiegel-crawler --from-firefox
+
+# c) feeds / section pages need no session at all
+./target/release/spiegel-crawler --list-url https://www.spiegel.de/schlagzeilen/index.rss -n 5 -o articles
 ```
 
 ## What you get
@@ -100,9 +104,16 @@ nav and other furniture are filtered out (see `SKIP_AREAS`/`SKIP_CLASSES`/
   set contains a live session — the give-away cookies are `sara_user_session`,
   `accessInfo`, `userInfo`, `authId` (`accessInfo` is a JWT whose `access`
   object lists your entitlements, e.g. `"Spplus": true`).
-* `--login` drives the SSO form itself and writes `cookies.json` plus
-  `urls.txt` — the latter only when the login was confirmed (a session cookie
-  appeared), so a failed attempt never leaves you with an anonymous link list. Later runs pick it up automatically; the browser is not needed
+* `--login` drives the SSO form itself: it asks for the e-mail address (visible)
+  and the password (**without echo**), fills
+  `gruppenkonto.spiegel.de/anmelden.html`, submits and waits for the session
+  cookie. Credentials come from `--user`/`--password`, else `$SPIEGEL_USER`/
+  `$SPIEGEL_PASS`, else the prompt; nothing else in the program ever reads them.
+  It writes `cookies.json` plus `urls.txt` — the latter only when the login was
+  confirmed, so a failed attempt never leaves you with an anonymous link list.
+  Both form variants are handled (e-mail + password on one page, or e-mail →
+  submit → password). On failure it prints what the page looked like (captcha,
+  2FA field, SSO error text); `--headed` shows the window. Later runs pick it up automatically; the browser is not needed
   again until the session expires.
 * Already have a session? Export the cookies from your browser into
   `cookies.json` (`{"cookies":[{"name":…,"value":…,"domain":…,"path":…}]}`) and
@@ -122,11 +133,16 @@ nav and other furniture are filtered out (see `SKIP_AREAS`/`SKIP_CLASSES`/
 * the browser layer: Chromium launch, navigation, scrolling, JS evaluation,
   link extraction, `Network.setCookies` / `Network.getCookies`
 
-**Not verified**: the `--login` credential flow (it needs a real account, and the
-test account was withdrawn). The form handling is verified up to the submit —
-the form is found, both fields are located by their `<label>` text and filled
-("Anmelden oder Konto erstellen" is the submit button) — and success is now
-decided by a session cookie appearing, not by a page flag.
+**Not verified end-to-end**: the `--login` credential flow, because it needs a
+real account and I will not send a fake one to their SSO. What *is* verified
+around it, on the live form: the e-mail field and the password field are located
+by their `<label>` text (`email_field: true`, `password_field: true`), the
+submit button is "Anmelden oder Konto erstellen", the prompt appears on a
+terminal and refuses an empty password before anything is submitted, and success
+is decided by the server setting a session cookie (`sara_user_session`,
+`accessInfo`, …) — not by a page flag. If the submit itself trips on a captcha
+or 2FA, `--login --headed` shows the window and the failure prints the page
+state.
 
 Two assumptions that measurement killed, recorded so they are not repeated:
 

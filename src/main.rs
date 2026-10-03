@@ -5,8 +5,8 @@
 //! drives the Chromium that is already installed, over the DevTools protocol.
 //!
 //! ```text
-//! # 1. log in once (writes cookies.json + urls.txt with your Merkliste)
-//! SPIEGEL_USER=you@example.com SPIEGEL_PASS=… cargo run --release -- --login --dry-run
+//! # 1. log in once with your account (writes cookies.json + urls.txt)
+//! cargo run --release -- --login --dry-run        # prompts for e-mail + password
 //!
 //! # 2. crawl everything
 //! cargo run --release -- --urls-file urls.txt --out articles
@@ -30,6 +30,7 @@ use fetch::Fetcher;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::io::IsTerminal;
 use std::sync::Mutex;
 use store::Store;
 
@@ -66,7 +67,7 @@ struct Cli {
     #[arg(long, value_name = "MAIL", env = "SPIEGEL_USER")]
     user: Option<String>,
 
-    /// SPIEGEL password (default: $SPIEGEL_PASS – prefer the env var)
+    /// SPIEGEL password (default: $SPIEGEL_PASS, otherwise asked for without echo)
     #[arg(long, value_name = "PASS", env = "SPIEGEL_PASS", hide_env_values = true)]
     password: Option<String>,
 
@@ -179,15 +180,19 @@ fn main() -> Result<()> {
 
     // ── 1. optional browser login ────────────────────────────────────────────
     if cli.login {
-        let user = cli
-            .user
-            .clone()
-            .or_else(|| prompt("SPIEGEL e-mail: "))
-            .context("no e-mail: pass --user or set $SPIEGEL_USER")?;
-        let pass = cli
-            .password
-            .clone()
-            .context("no password: set $SPIEGEL_PASS (or --password)")?;
+        // Credentials: --user/--password, else $SPIEGEL_USER/$SPIEGEL_PASS,
+        // else ask on the terminal (the password without echo).
+        let user = match cli.user.clone() {
+            Some(u) => u,
+            None => prompt_line("SPIEGEL e-mail: ")?.context("no e-mail given")?,
+        };
+        let pass = match cli.password.clone() {
+            Some(p) => p,
+            None => prompt_password("SPIEGEL password: ")?,
+        };
+        if pass.is_empty() {
+            bail!("empty password");
+        }
         let chrome = match &cli.chrome {
             Some(p) => p.clone(),
             None => browser::locate_chrome().context(
@@ -481,14 +486,28 @@ fn write_url_list(path: &str, urls: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn prompt(what: &str) -> Option<String> {
+/// Prompt on the terminal (visible input), e.g. for the e-mail address.
+fn prompt_line(what: &str) -> Result<Option<String>> {
     use std::io::Write;
     print!("{what}");
-    std::io::stdout().flush().ok()?;
+    std::io::stdout().flush().ok();
     let mut s = String::new();
-    std::io::stdin().read_line(&mut s).ok()?;
+    if std::io::stdin().read_line(&mut s)? == 0 {
+        return Ok(None); // EOF (e.g. no terminal attached)
+    }
     let s = s.trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
+    Ok(if s.is_empty() { None } else { Some(s) })
+}
+
+/// Prompt for a secret without echoing it.
+fn prompt_password(what: &str) -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "no terminal to ask for the password on – pass --password, set $SPIEGEL_PASS, \
+             or import an existing session with --from-firefox"
+        );
+    }
+    Ok(rpassword::prompt_password(what)?.trim().to_string())
 }
 
 fn now() -> String {

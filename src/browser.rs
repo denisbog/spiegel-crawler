@@ -314,6 +314,26 @@ impl Browser {
         Ok(seen)
     }
 
+    /// One-line summary of what the current page looks like – used when a login
+    /// step fails, so the user knows whether it was a captcha, 2FA or a typo.
+    /// Never includes input values.
+    pub fn diagnose(&mut self) -> String {
+        let js = r#"(() => {
+            const flags = [];
+            if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, [class*=captcha]')) flags.push('captcha');
+            if ([...document.querySelectorAll('input')].some(i => /otp|tan|code|token/i.test((i.name||'') + (i.id||'')))) flags.push('2FA field');
+            const err = document.querySelector('.error, [role=alert], .ui-messages-error, [class*=rror]');
+            return JSON.stringify({
+                url: location.href,
+                title: document.title,
+                flags,
+                inputs: [...document.querySelectorAll('input')].map(i => (i.type||'') + ':' + (i.name || i.id || '?')).slice(0, 12),
+                message: err ? err.textContent.trim().slice(0, 200) : document.body.innerText.replace(/\s+/g, ' ').slice(0, 200)
+            });
+        })()"#;
+        self.eval(js).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default()
+    }
+
     /// Install session cookies into the browser (Network.setCookies).
     pub fn set_cookies(&mut self, cookies: &[StorageCookie]) -> Result<usize> {
         if cookies.is_empty() {
@@ -397,64 +417,83 @@ pub fn login_and_dump(
 ) -> Result<LoginResult> {
     let mut b = Browser::launch(chrome, headed, proxy, verbose)?;
 
-    // 1. login form
+    // 1. login form. The SSO shows e-mail and password either together or in two
+    //    steps (the recorded session pressed Enter after the e-mail first), so we
+    //    accept both.
     if verbose {
         eprintln!("login: opening {LOGIN_URL}");
     }
-    b.goto(LOGIN_URL, Duration::from_millis(1200))?;
-    let has_form = format!(
+    let email_present = format!(
         r#"(() => {{ {FIND_FIELD_JS}
-             return !!document.querySelector('input[type=password]')
-                 && !![...document.querySelectorAll('input')].find(i => /E-Mail/i.test(labelOf(i))); }})()"#
+             return !![...document.querySelectorAll('input')].find(i => /E-Mail/i.test(labelOf(i))); }})()"#
     );
-    if !b.wait_for(&has_form, Duration::from_secs(25)) {
-        // maybe the homepage "Anmelden" link is the only way in
+    let password_present =
+        r#"document.querySelectorAll('input[type=password]').length > 0"#.to_string();
+
+    b.goto(LOGIN_URL, Duration::from_millis(1200))?;
+    if !b.wait_for(&email_present, Duration::from_secs(25)) {
         if verbose {
             eprintln!("login: no form on {LOGIN_URL}, trying the homepage link");
         }
         b.goto("https://www.spiegel.de/", Duration::from_millis(1500))?;
-        if !b.click_text("Anmelden")? {
-            bail!("no 'Anmelden' element and no login form found");
-        }
-        if !b.wait_for(&has_form, Duration::from_secs(25)) {
-            bail!("login form did not appear (e-mail/password field not found)");
+        b.click_text("Anmelden")?;
+        if !b.wait_for(&email_present, Duration::from_secs(25)) {
+            bail!("login form not found. page: {}", b.diagnose());
         }
     }
 
-    // 2. fill both fields (they are on the same page)
-    let fill = format!(
-        r#"(() => {{ {FIND_FIELD_JS}
-             const set = (el, v) => {{
-               const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value").set;
-               d.call(el, v);
-               el.dispatchEvent(new Event("input", {{bubbles: true}}));
-               el.dispatchEvent(new Event("change", {{bubbles: true}}));
-             }};
-             const u = [...document.querySelectorAll("input")].find(i => /E-Mail/i.test(labelOf(i)));
-             const p = document.querySelector("input[type=password]");
-             if (!u || !p) return "missing";
-             set(u, {user}); set(p, {pass});
-             return JSON.stringify({{user: u.value, pass_len: p.value.length}}); }})()"#,
-        user = serde_json::to_string(user)?,
-        pass = serde_json::to_string(password)?,
-    );
-    let filled = b.eval(&fill)?;
-    if verbose {
-        eprintln!("login: filled {filled}");
-    }
-    if filled.as_str() == Some("missing") {
-        bail!("could not fill the login form");
+    // fill one field, matched by its <label>/aria-label/name/placeholder
+    fn fill_js(re: &str, value: &str, fallback_password: bool) -> Result<String> {
+        Ok(format!(
+            r#"(() => {{ {FIND_FIELD_JS}
+                 const el = [...document.querySelectorAll("input")].find(i => /{re}/i.test(labelOf(i)))
+                     || {fallback};
+                 if (!el) return false;
+                 const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value").set;
+                 setter.call(el, {value});
+                 el.dispatchEvent(new Event("input", {{bubbles: true}}));
+                 el.dispatchEvent(new Event("change", {{bubbles: true}}));
+                 el.focus();
+                 return true; }})()"#,
+            value = serde_json::to_string(value)?,
+            fallback = if fallback_password { "document.querySelector('input[type=password]')" } else { "null" },
+        ))
     }
 
-    // 3. submit
-    b.eval(
+    // submit the current step
+    fn submit_js() -> &'static str {
         r#"(() => { const btn = [...document.querySelectorAll('button,input[type=submit]')]
-                     .find(x => /anmelden|login|einloggen|konto erstellen/i.test(x.textContent || x.value || ''));
+                     .find(x => /anmelden|login|einloggen|weiter|konto erstellen/i.test(x.textContent || x.value || ''));
                    if (btn) { btn.click(); return 'button'; }
-                   const f = document.querySelector('input[type=password]').form;
-                   if (f) { f.requestSubmit(); return 'submit'; }
-                   return 'nothing'; })()"#,
-    )?;
+                   const f = document.querySelector('input[type=password], input[type=email]');
+                   if (f && f.form) { f.form.requestSubmit(); return 'submit'; }
+                   return 'nothing'; })()"#
+    }
+
+    if verbose {
+        eprintln!("login: filling the e-mail field");
+    }
+    if b.eval(&fill_js("E-Mail", user, false)?)?.as_bool() != Some(true) {
+        bail!("could not fill the e-mail field. page: {}", b.diagnose());
+    }
+
+    if b.eval(&password_present)?.as_bool() != Some(true) {
+        // two-step variant: submit the e-mail, then wait for the password
+        if verbose {
+            eprintln!("login: two-step form, asking for the password");
+        }
+        b.eval(submit_js())?;
+        if !b.wait_for(&password_present, Duration::from_secs(25)) {
+            bail!("password field did not appear. page: {}", b.diagnose());
+        }
+    }
+    if verbose {
+        eprintln!("login: filling the password");
+    }
+    if b.eval(&fill_js("Passwort|Password", password, true)?)?.as_bool() != Some(true) {
+        bail!("could not fill the password field. page: {}", b.diagnose());
+    }
+    b.eval(submit_js())?;
 
     // 4. back to spiegel.de: the SSO sets the session cookies only on success
     b.goto("https://www.spiegel.de/", Duration::from_millis(2500))?;
@@ -470,14 +509,9 @@ pub fn login_and_dump(
     if logged_in {
         println!("login: ok");
     } else {
-        let msg = b
-            .eval(r#"(() => { const e = document.querySelector('.error, [role=alert], .ui-messages-error, [class*=rror]');
-                 return e ? e.textContent.trim().slice(0, 200) : ""; })()"#)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default();
-        eprintln!("! login was not confirmed{}", if msg.is_empty() { String::new() } else { format!(": {msg}") });
-        eprintln!("  hint: rerun with --headed to see the form (2FA, captcha, wrong password?)");
+        eprintln!("! login was not confirmed – no session cookie was set");
+        eprintln!("  page: {}", b.diagnose());
+        eprintln!("  hint: rerun with --headed to watch the form (2FA, captcha, wrong password?)");
     }
 
     // 5. the Merkliste
