@@ -1,0 +1,14 @@
+/target
+
+# crawler output (copyrighted article text, images, audio)
+articles*/
+test/
+
+# sessions & credentials – never commit
+cookies.json
+state.json
+urls.txt
+script.py
+*.part
+
+__pycache__/
