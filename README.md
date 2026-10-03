@@ -15,10 +15,13 @@ cargo build --release
 ./target/release/spiegel-crawler --list-url https://www.spiegel.de/fuermich/merkliste \
     --render -o articles-ihre-artikel
 
-# b) alternative without any credentials: reuse the session of your own browser
+# b) the same login with plain requests only – no browser at all
+./target/release/spiegel-crawler --login-http
+
+# c) alternative without any credentials: reuse the session of your own browser
 ./target/release/spiegel-crawler --from-firefox
 
-# c) feeds / section pages need no session at all
+# d) feeds / section pages need no session at all
 ./target/release/spiegel-crawler --list-url https://www.spiegel.de/schlagzeilen/index.rss -n 5 -o articles
 ```
 
@@ -41,9 +44,11 @@ downloads resume (`*.part` + HTTP range requests).
 |---|---|---|
 | Article fetch | `reqwest` + `scraper` (no JS) | article pages are fully server-rendered |
 | Listing (RSS, sections) | plain HTTP | the links are in the HTML |
-| Listing (Merkliste) | headless Chromium over CDP, with the session cookies installed via `Network.setCookies` | `spiegel.de/fuermich/merkliste` has **no** article links in its HTML — the page fetches the list with JS, so a plain HTTP GET sees an empty list even when you are logged in |
+| Listing (Merkliste) | `GET /services/depot/api/v1/bookmarks` then `GET /services/sitesearch/fetch?ids=…` (`src/api.rs`) | the page has no article links in its HTML — it fetches this API with JS. Two plain requests give the list, so no browser is involved. Found by capturing the page's network log (`--dump-network`) |
+| Listing (Merkliste), browser | headless Chromium over CDP, session cookies installed with `Network.setCookies` | fallback for `--render`, and the way `--login` reads the list |
 | Session | `--from-firefox` reads `cookies.sqlite` (pure Rust, via `rusqlite`) | if you are logged in in your own browser you already have a session — no need to automate a login at all |
-| Login (optional) | headless Chromium over CDP | the SSO form is a JSF app on `gruppenkonto.spiegel.de` with captcha/2FA risk; `--login` is there for machines without a browser session |
+| Login (plain HTTP) | `POST gruppenkonto.spiegel.de/anmelden.html` (`src/login.rs`, `src/form.rs`) | the SSO form is a plain `application/x-www-form-urlencoded` POST with `jakarta.faces.ViewState=stateless`, no captcha and no bot-protection script — so it can be replayed |
+| Login (browser) | headless Chromium over CDP | kept as `--login` for the case where the HTTP replay trips (2FA, a form change) |
 | Crawl | `reqwest` + the session cookies from the browser | one browser visit, then hundreds of fast HTTP requests |
 
 The CDP client (`src/browser.rs`) is ~300 lines of `tungstenite` + `serde_json`:
@@ -79,6 +84,9 @@ nav and other furniture are filtered out (see `SKIP_AREAS`/`SKIP_CLASSES`/
 | `--check-session` | report what the current cookies give you (and what is missing) and exit |
 | `--render` | force the browser for listing pages even if HTTP finds links |
 | `--login` | log in with Chromium, then write `urls.txt` + `cookies.json` |
+| `--login-http` | log in with plain HTTP requests only (no browser) and write `cookies.json` |
+| `--parse-form <URL>` | show the login form a page serves (GET only, no credentials sent) |
+| `--dump-network` | with `--dump-url`: log the requests the page makes (how the API was found) |
 | `--merkliste-url <URL>` | default `https://www.spiegel.de/fuermich/merkliste` |
 | `--user` / `--password` | credentials (defaults: `$SPIEGEL_USER`, `$SPIEGEL_PASS`) |
 | `--headed` | show the browser window (debug a login) |
@@ -104,6 +112,10 @@ nav and other furniture are filtered out (see `SKIP_AREAS`/`SKIP_CLASSES`/
   set contains a live session — the give-away cookies are `sara_user_session`,
   `accessInfo`, `userInfo`, `authId` (`accessInfo` is a JWT whose `access`
   object lists your entitlements, e.g. `"Spplus": true`).
+* `--login-http` does the same without a browser: it GETs the form, POSTs the
+  e-mail (`loginform:username` + `_csrf` + `jakarta.faces.ViewState` +
+  `loginform:submit`), then POSTs the password in the step the server reveals,
+  and only accepts the result if a session cookie comes back.
 * `--login` drives the SSO form itself: it asks for the e-mail address (visible)
   and the password (**without echo**), fills
   `gruppenkonto.spiegel.de/anmelden.html`, submits and waits for the session
@@ -125,16 +137,31 @@ nav and other furniture are filtered out (see `SKIP_AREAS`/`SKIP_CLASSES`/
 
 **Verified** against the live site:
 
-* crawling `https://www.spiegel.de/fuermich/merkliste` ("Ihre Artikel") with a
-  Firefox session: 5 bookmarks → 5 folders, complete SPIEGEL+ text (up to 2314
-  words), 26 images/audio files, 45 MB, 0 failures
+* crawling `https://www.spiegel.de/fuermich/merkliste` ("Ihre Artikel"): 5
+  bookmarks → 5 folders, complete SPIEGEL+ text (up to 2314 words), 26
+  images/audio files, 45 MB, 0 failures
+* the Merkliste listing **without any browser**: two JSON requests return the
+  same five bookmarks (with titles and access level); without a session the
+  bookmarks endpoint answers `400 http: named cookie not present`
+* the login form is parsed correctly from the live page (`--parse-form` prints
+  action, method, `loginform:username`, `password`, `loginform:submit` and the
+  six hidden fields)
 * article extraction, markdown + JSON output, resumable and parallel downloads
 * section/feed listing over plain HTTP (`/politik/index.rss`, `/politik/`)
 * the browser layer: Chromium launch, navigation, scrolling, JS evaluation,
   link extraction, `Network.setCookies` / `Network.getCookies`
 
-**Not verified end-to-end**: the `--login` credential flow, because it needs a
-real account and I will not send a fake one to their SSO. What *is* verified
+**Not verified end-to-end**: the credential login, neither `--login` (browser)
+nor `--login-http` (plain requests), because it needs a real account and I will
+not send a fake one to their SSO. For the plain path there is direct evidence
+that it is replayable — `POST` (not GET), `application/x-www-form-urlencoded`,
+`jakarta.faces.ViewState=stateless`, no captcha/hCaptcha/Turnstile, no Akamai
+sensor, no DataDome/Kasada/PerimeterX, and the two-step shape
+(`loginform:step=anmelden`, password field `display:none` in step 1) matches the
+recorded browser session. Use `-v` to watch the two POSTs and `--parse-form` to
+inspect the form at any time; nothing is logged but field names.
+
+What *is* verified
 around it, on the live form: the e-mail field and the password field are located
 by their `<label>` text (`email_field: true`, `password_field: true`), the
 submit button is "Anmelden oder Konto erstellen", the prompt appears on a

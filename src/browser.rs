@@ -79,6 +79,8 @@ pub struct Browser {
     next_id: u64,
     session: String,
     profile: PathBuf,
+    /// CDP events seen while issuing commands (used by --dump-network)
+    events: Vec<Value>,
 }
 
 impl Browser {
@@ -137,7 +139,7 @@ impl Browser {
         }
         let (ws, _) = connect(ws_url.as_str()).context("connecting to Chromium DevTools")?;
 
-        let mut b = Browser { child, ws, next_id: 0, session: String::new(), profile };
+        let mut b = Browser { child, ws, next_id: 0, session: String::new(), profile, events: Vec::new() };
         let target = b.command("Target.createTarget", json!({"url": "about:blank"}), None)?;
         let target_id = target["targetId"].as_str().context("Target.createTarget: no targetId")?.to_string();
         let attached = b.command(
@@ -177,7 +179,13 @@ impl Browser {
                 Err(_) => continue,
             };
             if v.get("id").and_then(Value::as_u64) != Some(id) {
-                continue; // event or another command's reply
+                // an event (or another command's reply) – keep the interesting ones
+                if let Some(m) = v.get("method").and_then(Value::as_str) {
+                    if m.starts_with("Network.") && self.events.len() < 4000 {
+                        self.events.push(v);
+                    }
+                }
+                continue;
             }
             if let Some(err) = v.get("error") {
                 bail!("{method} failed: {err}");
@@ -312,6 +320,30 @@ impl Browser {
             }
         }
         Ok(seen)
+    }
+
+    /// Requests the page made so far (method, url, type), filtered to the site.
+    pub fn network_log(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in &self.events {
+            if e.get("method").and_then(Value::as_str) != Some("Network.requestWillBeSent") {
+                continue;
+            }
+            let Some(p) = e.get("params") else { continue };
+            let url = p.get("request").and_then(|r| r.get("url")).and_then(Value::as_str).unwrap_or("");
+            if !url.contains("spiegel.de") {
+                continue;
+            }
+            if url.ends_with(".js") || url.ends_with(".css") || url.ends_with(".woff2") || url.ends_with(".png") {
+                continue;
+            }
+            let method = p.get("request").and_then(|r| r.get("method")).and_then(Value::as_str).unwrap_or("GET");
+            let kind = p.get("type").and_then(Value::as_str).unwrap_or("?");
+            out.push(format!("{method:4} {kind:9} {url}"));
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// One-line summary of what the current page looks like – used when a login

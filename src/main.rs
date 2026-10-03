@@ -6,7 +6,8 @@
 //!
 //! ```text
 //! # 1. log in once with your account (writes cookies.json + urls.txt)
-//! cargo run --release -- --login --dry-run        # prompts for e-mail + password
+//! cargo run --release -- --login --dry-run        # browser-driven, prompts for e-mail + password
+//! cargo run --release -- --login-http             # same, but plain HTTP requests only
 //!
 //! # 2. crawl everything
 //! cargo run --release -- --urls-file urls.txt --out articles
@@ -15,11 +16,14 @@
 //! Without a login it still crawls every article link found in `--list-url`
 //! (RSS feeds, section pages) and all `--url`/`--urls-file` entries.
 
+mod api;
 mod article;
 mod auth;
 mod browser;
 mod fetch;
+mod form;
 mod firefox;
+mod login;
 mod store;
 mod util;
 
@@ -58,6 +62,14 @@ struct Cli {
     /// Log in with Chromium first, then dump the Merkliste to urls.txt + cookies.json
     #[arg(long)]
     login: bool,
+
+    /// Log in with plain HTTP requests only (no browser at all)
+    #[arg(long = "login-http")]
+    login_http: bool,
+
+    /// Debug: GET this URL and print the login form found in it (no credentials sent)
+    #[arg(long = "parse-form", value_name = "URL")]
+    parse_form: Option<String>,
 
     /// Merkliste URL to dump after --login
     #[arg(long = "merkliste-url", default_value = MERKLISTE, value_name = "URL")]
@@ -106,6 +118,10 @@ struct Cli {
     /// Debug: render this URL in the browser, print the value of --eval, then exit (repeatable)
     #[arg(long = "dump-url", value_name = "URL")]
     dump_urls: Vec<String>,
+
+    /// Debug: with --dump-url, print the requests the page made (find the API behind the UI)
+    #[arg(long = "dump-network")]
+    dump_network: bool,
 
     /// Debug: JS expression evaluated by --dump-url (may be async)
     #[arg(long, value_name = "JS", default_value = "document.title")]
@@ -178,7 +194,67 @@ fn main() -> Result<()> {
         println!("session: {} cookies -> {}", state.cookies.len(), cli.cookies.display());
     }
 
-    // ── 1. optional browser login ────────────────────────────────────────────
+    // ── 0b. debug: show the login form a page serves (GET only) ──────────────
+    if let Some(url) = &cli.parse_form {
+        let probe = Fetcher::new(None, cli.delay_ms, cli.verbose, cli.proxy.as_deref())?;
+        let f = login::fetch_form(&probe, url)?;
+        println!("action:           {}", f.action);
+        println!("method:           {}", f.method);
+        println!("e-mail field:     {:?}", f.email);
+        println!("password field:   {:?} (visible now: {})", f.password, f.password_visible);
+        println!("submit control:   {:?}", f.submit);
+        println!("hidden fields:    {:?}", f.fields.iter().filter(|x| x.kind == "hidden").map(|x| x.name.clone()).collect::<Vec<_>>());
+        println!("error on page:    {:?}", f.error);
+        return Ok(());
+    }
+
+    // ── 1. optional login: plain HTTP or browser ─────────────────────────────
+    if cli.login_http {
+        let user = match cli.user.clone() {
+            Some(u) => u,
+            None => prompt_line("SPIEGEL e-mail: ")?.context("no e-mail given")?,
+        };
+        let pass = match cli.password.clone() {
+            Some(p) => p,
+            None => prompt_password("SPIEGEL password: ")?,
+        };
+        if pass.is_empty() {
+            bail!("empty password");
+        }
+        // a real jar: the two JSF steps must carry each other's cookies
+        let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+        let probe = Fetcher::new(Some(jar), cli.delay_ms, cli.verbose, cli.proxy.as_deref())?;
+        let res = login::login(&probe, &user, &pass, cli.verbose)?;
+        if cli.verbose {
+            let held = probe.cookie_names("https://www.spiegel.de/");
+            eprintln!("http login: cookies now held: {held:?}");
+        }
+        if !res.logged_in {
+            bail!("login finished without a session cookie");
+        }
+        // merge into whatever cookies.json already had (consent etc.)
+        let mut state = if cli.cookies.exists() {
+            auth::StorageState::load(&cli.cookies)?
+        } else {
+            auth::StorageState::from_cookies(Vec::new())
+        };
+        for c in res.cookies {
+            if let Some(slot) = state.cookies.iter_mut().find(|e| e.name == c.name && e.domain == c.domain) {
+                *slot = c;
+            } else {
+                state.cookies.push(c);
+            }
+        }
+        state.save(&cli.cookies)?;
+        println!(
+            "login: ok (plain HTTP, no browser) – {} cookies -> {}",
+            state.cookies.len(),
+            cli.cookies.display()
+        );
+        println!("note: --from-firefox is now unnecessary; --check-session verifies the session");
+        return Ok(());
+    }
+
     if cli.login {
         // Credentials: --user/--password, else $SPIEGEL_USER/$SPIEGEL_PASS,
         // else ask on the terminal (the password without echo).
@@ -275,6 +351,17 @@ fn main() -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(1500));
             }
             let v = b.eval(&cli.eval)?;
+            if cli.dump_network {
+                // give the page's own fetches time to happen, then scroll (lazy lists)
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let _ = b.eval("window.scrollTo(0, document.body.scrollHeight)");
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                println!("--- requests ---");
+                for line in b.network_log() {
+                    println!("{line}");
+                }
+                println!("--- result ---");
+            }
             println!("{}", serde_json::to_string_pretty(&v)?);
         }
         return Ok(());
@@ -421,7 +508,26 @@ fn collect_urls(
     }
 
     for list in &cli.list_urls {
-        let mut found = http_links(fetcher, list)?;
+        let mut found = Vec::new();
+
+        // Personal lists have a JSON API – no browser needed.
+        if is_personal(list) && !cli.render {
+            match api::bookmarks(fetcher) {
+                Ok(marks) if !marks.is_empty() => {
+                    println!("listing {list}: {} bookmark(s) via {}", marks.len(), api::BOOKMARKS_API);
+                    for m in &marks {
+                        println!("  {} [{}]", m.title, if m.access_level.is_empty() { "?" } else { &m.access_level });
+                    }
+                    found = marks.into_iter().map(|m| m.url).collect();
+                }
+                Ok(_) => eprintln!("  ! the bookmarks API reports an empty list"),
+                Err(e) => eprintln!("  ! bookmarks API failed ({e:#}); falling back to the page"),
+            }
+        }
+
+        if found.is_empty() {
+            found = http_links(fetcher, list)?;
+        }
         if found.is_empty() || cli.render {
             if let Some(chrome) = cli.chrome.clone().or_else(browser::locate_chrome) {
                 println!("listing {list}: rendering in the browser…");
@@ -470,6 +576,11 @@ fn collect_urls(
     }
 
     Ok(set.into_iter().collect())
+}
+
+/// Pages under /fuermich/ are "mine": they are backed by the bookmarks API.
+fn is_personal(url: &str) -> bool {
+    url.contains("/fuermich/")
 }
 
 fn http_links(fetcher: &Fetcher, url: &str) -> Result<Vec<String>> {

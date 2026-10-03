@@ -3,19 +3,21 @@
 
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::{Client, Response};
-use reqwest::cookie::Jar;
-use reqwest::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, RANGE};
+use reqwest::cookie::{CookieStore, Jar};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, RANGE, SET_COOKIE};
 use reqwest::StatusCode;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use url::Url;
 
 pub const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 pub struct Fetcher {
     client: Client,
+    jar: Option<Arc<Jar>>,
     delay: Duration,
     retries: u32,
     pub verbose: bool,
@@ -28,14 +30,15 @@ impl Fetcher {
             .timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(15))
             .pool_max_idle_per_host(8);
-        if let Some(jar) = jar {
-            b = b.cookie_provider(jar);
+        if let Some(jar) = &jar {
+            b = b.cookie_provider(jar.clone());
         }
         if let Some(p) = proxy {
             b = b.proxy(reqwest::Proxy::all(p).with_context(|| format!("bad --proxy {p:?}"))?);
         }
         Ok(Self {
             client: b.build().context("building HTTP client")?,
+            jar,
             delay: Duration::from_millis(delay_ms),
             retries: 3,
             verbose,
@@ -97,6 +100,66 @@ impl Fetcher {
         let final_url = resp.url().to_string();
         let body = resp.text().context("decoding response body")?;
         Ok((final_url, body))
+    }
+
+    /// Same, but asking for JSON (used by the endpoints in `api.rs`).
+    pub fn text_with_accept(&self, url: &str, accept: &str) -> Result<(String, String)> {
+        let resp = self
+            .client
+            .get(url)
+            .header(ACCEPT, accept)
+            .header(ACCEPT_ENCODING, "identity")
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("HTTP {status} for {url}");
+        }
+        let final_url = resp.url().to_string();
+        let body = resp.text().context("decoding response body")?;
+        Ok((final_url, body))
+    }
+
+    /// POST an `application/x-www-form-urlencoded` body (used by the login).
+    /// Returns `(final_url, body, status, set-cookie headers)`.
+    pub fn post_form(&self, url: &str, body: &str) -> Result<(String, String, u16, Vec<String>)> {
+        self.pace();
+        let resp = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(ACCEPT, "text/html,application/xhtml+xml")
+            .header(ACCEPT_LANGUAGE, "de-DE,de;q=0.9")
+            .body(body.to_string())
+            .send()
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status().as_u16();
+        let final_url = resp.url().to_string();
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(String::from))
+            .collect();
+        let body = resp.text().context("decoding POST response")?;
+        Ok((final_url, body, status, cookies))
+    }
+
+    /// Cookie names currently held for a URL (values are never exposed).
+    pub fn cookie_names(&self, url: &str) -> Vec<String> {
+        let (Some(jar), Ok(u)) = (&self.jar, Url::parse(url)) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = jar
+            .cookies(&u)
+            .and_then(|h| h.to_str().ok().map(String::from))
+            .unwrap_or_default()
+            .split("; ")
+            .filter_map(|c| c.split('=').next().map(String::from))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Download to `dest`, resuming a `dest.part` file if present.

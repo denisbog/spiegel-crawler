@@ -121,6 +121,33 @@ pub fn looks_logged_in(cookies: &[StorageCookie]) -> bool {
     cookies.iter().any(|c| SESSION_COOKIE_HINTS.contains(&c.name.as_str()))
 }
 
+/// Parse one `Set-Cookie` header into a storable cookie.
+pub fn parse_set_cookie(raw: &str, host: &str) -> Option<StorageCookie> {
+    let mut parts = raw.split(';');
+    let (name, value) = parts.next()?.split_once('=')?;
+    let mut c = StorageCookie {
+        name: name.trim().to_string(),
+        value: value.trim().to_string(),
+        domain: host.to_string(),
+        path: "/".to_string(),
+        secure: false,
+        http_only: false,
+    };
+    for attr in parts {
+        let attr = attr.trim();
+        let (k, v) = attr.split_once('=').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .unwrap_or((attr.to_ascii_lowercase(), String::new()));
+        match k.as_str() {
+            "domain" => c.domain = v,
+            "path" => c.path = v,
+            "secure" => c.secure = true,
+            "httponly" => c.http_only = true,
+            _ => {}
+        }
+    }
+    Some(c)
+}
+
 /// Build a jar from `--cookie name=value` pairs (all for .spiegel.de).
 pub fn jar_from_pairs(pairs: &[String]) -> Result<Arc<Jar>> {
     let jar = Arc::new(Jar::default());
