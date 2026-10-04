@@ -159,7 +159,7 @@ pub fn parse(url: &str, html: &str, fetched_at: &str) -> Article {
 
     let title = json_str(ld.as_ref(), &["headline"])
         .or_else(|| json_path(settings.as_ref(), &["page", "info", "title"]).and_then(Value::as_str).map(String::from))
-        .or_else(|| doc.select(&sel("h1")).next().map(|e| clean(&e.text().collect::<String>())))
+        .or_else(|| doc.select(&sel("h1")).next().map(|e| text_of(e)))
         .unwrap_or_default();
 
     let kicker = json_path(settings.as_ref(), &["app", "pageContext", "clip", "kicker"])
@@ -352,9 +352,9 @@ fn extract_body(doc: &Html, title: &str) -> (Vec<Block>, Vec<Image>, bool) {
                     let source = el
                         .select(&sel(".RichTextCaption"))
                         .next()
-                        .map(|c| clean(&c.text().collect::<String>()))
+                        .map(|c| text_of(c))
                         .unwrap_or_default();
-                    let full = clean(&el.text().collect::<String>());
+                    let full = text_of(el);
                     let text = clean(&full.replace(&source, ""));
                     if !text.is_empty() {
                         blocks.push(Block::Quote { text, source });
@@ -371,7 +371,7 @@ fn extract_body(doc: &Html, title: &str) -> (Vec<Block>, Vec<Image>, bool) {
                 }
                 if !added {
                     // figure with only text (quote box etc.) -> keep the words
-                    let t = clean(&el.text().collect::<String>());
+                    let t = text_of(el);
                     if !t.is_empty() && !is_boilerplate(&t) {
                         blocks.push(Block::Para { text: t });
                     }
@@ -386,7 +386,7 @@ fn extract_body(doc: &Html, title: &str) -> (Vec<Block>, Vec<Image>, bool) {
                 }
             }
             tag => {
-                let text = clean(&el.text().collect::<String>());
+                let text = text_of(el);
                 if text.is_empty() || is_boilerplate(&text) {
                     continue;
                 }
@@ -517,14 +517,14 @@ fn image_id(u: &str) -> Option<String> {
 fn caption_of(scope: ElementRef) -> String {
     // figure > figcaption, or the element's own parent figcaption
     if let Some(c) = scope.select(&sel("figcaption")).next() {
-        return clean(&c.text().collect::<String>());
+        return text_of(c);
     }
     if let Some(p) = scope.parent().and_then(ElementRef::wrap) {
         if p.value().name() == "figcaption" {
-            return clean(&p.text().collect::<String>());
+            return text_of(p);
         }
         if let Some(c) = p.select(&sel("figcaption")).next() {
-            return clean(&c.text().collect::<String>());
+            return text_of(c);
         }
     }
     scope.value().attr("title").map(clean).unwrap_or_default()
@@ -597,6 +597,26 @@ fn ancestors_skipped(el: ElementRef) -> bool {
 }
 
 // ---------------------------------------------------------------- helpers
+/// Visible text of an element, ignoring embedded `<style>`/`<script>` islands.
+/// Some sites inline incremental CSS (with a `@media` block) right next to a
+/// pull quote, and `ElementRef::text()` would otherwise pick up the CSS rules.
+fn text_of(el: ElementRef) -> String {
+    let mut out = String::new();
+    for node in el.descendants() {
+        let Some(t) = node.value().as_text() else {
+            continue;
+        };
+        let hidden = node.ancestors().any(|a| {
+            ElementRef::wrap(a)
+                .is_some_and(|e| matches!(e.value().name(), "style" | "script" | "template" | "noscript"))
+        });
+        if !hidden {
+            out.push_str(&t.text);
+            out.push(' ');
+        }
+    }
+    clean(&out)
+}
 
 fn sel(s: &str) -> Selector {
     Selector::parse(s).expect("valid selector")
@@ -811,4 +831,31 @@ pub fn image_file_name(index: usize, img: &Image) -> String {
         .unwrap_or_else(|| "jpg".to_string());
     let w = img.width.map(|w| format!("_w{w}")).unwrap_or_default();
     format!("{:02}_{}{}.{}", index + 1, safe_file_name(&img.id), w, ext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pull quotes can carry an inline incremental `<style>` island; its CSS
+    /// rules must not leak into the quote text.
+    #[test]
+    fn quote_text_skips_inline_style() {
+        let html = r#"<html><body><article>
+            <section data-area="quote">
+              <style>.style-3b7c186c {color: #569bf5;}@media (prefers-color-scheme: dark) {.style-3b7c186c {color: #7cd2ee;}}</style>
+              <p>»Das Konzept Autismus hat sich deutlich verändert.«</p>
+              <div class="RichTextCaption">Sebastian Lundström, Autismusforscher</div>
+            </section>
+        </article></body></html>"#;
+        let doc = Html::parse_document(html);
+        let (blocks, _, _) = extract_body(&doc, "Test");
+        let quote = blocks.iter().find_map(|b| match b {
+            Block::Quote { text, source } => Some((text.clone(), source.clone())),
+            _ => None,
+        });
+        let (text, source) = quote.expect("quote block");
+        assert_eq!(text, "»Das Konzept Autismus hat sich deutlich verändert.«");
+        assert_eq!(source, "Sebastian Lundström, Autismusforscher");
+    }
 }
